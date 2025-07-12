@@ -7,8 +7,8 @@ import random
 import traceback
 from django.conf import settings
 from konlpy.tag import Okt 
-from anthropic import Anthropic
-from backend.content.models import BlogContent, MorphemeAnalysis
+import google.generativeai as genai
+from content.models import BlogContent, MorphemeAnalysis
 from .formatter import ContentFormatter
 from .substitution_generator import SubstitutionGenerator
 from .morpheme_analyzer import MorphemeAnalyzer 
@@ -17,14 +17,14 @@ logger = logging.getLogger(__name__)
 
 class ContentOptimizer:
     """
-    Claude API를 사용한 블로그 콘텐츠 최적화 클래스
+    Gemini API를 사용한 블로그 콘텐츠 최적화 클래스
     주요 기능: 글자수, 키워드 출현 횟수 확인 및 최적화
     """
 
     def __init__(self):
-        self.anthropic_api_key = settings.ANTHROPIC_API_KEY
-        self.model = "claude-3-5-sonnet-20240620" # 최신 모델 사용
-        self.client = Anthropic(api_key=self.anthropic_api_key)
+        self.google_api_key = settings.GOOGLE_API_KEY
+        genai.configure(api_key=self.google_api_key)
+        self.model = genai.GenerativeModel('gemini-2.5-pro')
         self.okt = Okt() 
         self.substitution_generator = SubstitutionGenerator()
         self.morpheme_analyzer = MorphemeAnalyzer()
@@ -70,14 +70,15 @@ class ContentOptimizer:
                     
                     logger.info(f"API 최적화 시도 #{attempt+1}/3, temperature={temp}")
 
-                    response = self.client.messages.create(
-                        model=self.model,
-                        max_tokens=4096,
-                        temperature=temp,
-                        messages=[{"role": "user", "content": prompt}]
+                    response = self.model.generate_content(
+                        prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            temperature=temp,
+                            max_output_tokens=4096
+                        )
                     )
                     
-                    current_api_output = response.content[0].text
+                    current_api_output = response.text
                     analysis_of_api_output = self.morpheme_analyzer.analyze(current_api_output, keyword, custom_morphemes_for_analysis)
                     
                     logger.info(f"API 시도 #{attempt+1} 결과: 글자수={analysis_of_api_output['char_count']}, 목표형태소 유효={analysis_of_api_output['is_valid_morphemes']}")
@@ -443,7 +444,7 @@ class ContentOptimizer:
         
         return " ".join(s.strip() for s in sentences if s.strip())
 
-    def _ask_claude_for_sentence_reduction(self, sentence, morpheme_to_reduce):
+    def _ask_llm_for_sentence_reduction(self, sentence, morpheme_to_reduce):
         """
         Claude에게 특정 형태소를 문장에서 제거하거나 문장 전체를 삭제할지 문의하고,
         자연스러움을 유지하도록 요청합니다.
@@ -468,23 +469,24 @@ class ContentOptimizer:
         어떤 설명이나 다른 텍스트도 추가하지 마세요.
         """
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=500,
-                temperature=0.1,
-                messages=[{"role": "user", "content": prompt}]
+            response = self.model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.3,
+                    max_output_tokens=1024
+                )
             )
-            return response.content[0].text.strip()
+            return response.text.strip()
         except Exception as e:
-            logger.error(f"Claude sentence reduction API error: {e}")
+            logger.error(f"Gemini sentence reduction API error: {e}")
             return sentence
 
     def _reduce_morpheme_to_target(self, content, morpheme_to_reduce, target_count, all_target_morphemes_dict):
         """
         특정 형태소의 출현 횟수를 목표치(target_count)까지 줄입니다.
-        클로드에게 문맥상 자연스러움을 확인하도록 요청합니다.
+        Gemini에게 문맥상 자연스러움을 확인하도록 요청합니다.
         """
-        logger.info(f"형태소 '{morpheme_to_reduce}' 횟수를 목표치({target_count}회)에 맞게 제거 (클로드 문맥 고려)")
+        logger.info(f"형태소 '{morpheme_to_reduce}' 횟수를 목표치({target_count}회)에 맞게 제거 (Gemini 문맥 고려)")
 
         # Determine counting method based on morpheme type (base or compound)
         temp_analysis_for_type = self.morpheme_analyzer.analyze(content, "", all_target_morphemes_dict['all_list'])
@@ -531,17 +533,17 @@ class ContentOptimizer:
                 logger.warning(f"형태소 '{morpheme_to_reduce}'를 포함하는 문장을 찾을 수 없습니다. (현재 {current_count}회)")
                 break
 
-            # Send ALL relevant sentences to Claude for processing
+            # Send ALL relevant sentences to Gemini for processing
             modified_sentences_map = {}
             for idx in sentences_with_morpheme_indices:
                 original_sentence = sentences[idx]
-                claude_modified_sentence = self._ask_claude_for_sentence_reduction(original_sentence, morpheme_to_reduce)
-                modified_sentences_map[idx] = claude_modified_sentence
+                reduced_sentence_or_keyword = self._ask_llm_for_sentence_reduction(original_sentence, morpheme_to_reduce)
+                modified_sentences_map[idx] = reduced_sentence_or_keyword
                 
-                if claude_modified_sentence != original_sentence:
-                    logger.info(f"클로드: 문장 '{original_sentence[:30]}...'에서 형태소 '{morpheme_to_reduce}' 수정/제거 시도.")
+                if reduced_sentence_or_keyword != original_sentence:
+                    logger.info(f"Gemini: 문장 '{original_sentence[:30]}...'에서 형태소 '{morpheme_to_reduce}' 수정/제거 시도.")
                 else:
-                    logger.info(f"클로드: 문장 '{original_sentence[:30]}...' 변경 없음.")
+                    logger.info(f"Gemini: 문장 '{original_sentence[:30]}...' 변경 없음.")
 
             new_sentences = [modified_sentences_map.get(i, s) for i, s in enumerate(sentences)]
             

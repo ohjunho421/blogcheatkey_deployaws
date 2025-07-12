@@ -8,10 +8,10 @@ from urllib.parse import urlparse
 from django.conf import settings
 from konlpy.tag import Okt
 from anthropic import Anthropic
-from backend.research.models import ResearchSource, StatisticData
-from backend.key_word.models import Keyword, Subtopic
-from backend.content.models import BlogContent, MorphemeAnalysis
-from backend.accounts.models import User
+from research.models import ResearchSource, StatisticData
+from key_word.models import Keyword, Subtopic
+from content.models import BlogContent, MorphemeAnalysis
+from accounts.models import User
 from .substitution_generator import SubstitutionGenerator
 from .morpheme_analyzer import MorphemeAnalyzer 
 
@@ -26,7 +26,7 @@ class ContentGenerator:
     
     def __init__(self):
         self.anthropic_api_key = settings.ANTHROPIC_API_KEY
-        self.model = "claude-3-5-sonnet-20240620" # Model updated
+        self.model = "claude-sonnet-4-20250514" # Model updated
         self.client = Anthropic(api_key=self.anthropic_api_key)
         self.okt = Okt()
         self.max_retries = 3 # API 호출 재시도 횟수
@@ -170,25 +170,41 @@ class ContentGenerator:
                 logger.info(f"콘텐츠 생성 완료: ID={blog_content.id}")
                 return blog_content.id
                     
-            except Exception as e:
-                logger.error(f"콘텐츠 생성 중 오류 발생 (시도 {attempt+1}/{self.max_retries}): {str(e)}")
-                logger.error(traceback.format_exc())
-                
-                if 'overloaded_error' in str(e).lower() and attempt < self.max_retries - 1:
-                    logger.warning(f"서버가 혼잡합니다. {self.retry_delay}초 후 재시도합니다...")
-                    time.sleep(self.retry_delay)
-                elif attempt == self.max_retries - 1:
-                    logger.error("최대 재시도 횟수 도달. 콘텐츠 생성 실패.")
+            except anthropic.OverloadedError as e:
+                logger.warning(f"Anthropic API 과부하 (시도 {attempt+1}/{self.max_retries}). 오류: {e}")
+                if attempt >= self.max_retries - 1:
+                    logger.error("최대 재시도 횟수 초과. API 과부하가 지속됩니다.")
                     if existing_content:
                         existing_content.title = f"{keyword_text} (생성 실패)"
-                        existing_content.content = f"콘텐츠 생성 중 오류 발생: {str(e)}"
+                        existing_content.content = f"콘텐츠 생성 중 최종 오류 발생: {str(e)}"
                         existing_content.save()
                     return None
-                else:
-                    time.sleep(self.retry_delay)
-        
-        logger.error(f"모든 ({self.max_retries}회) 시도 후에도 콘텐츠 생성 실패: 키워드 ID {keyword_id}")
-        return None
+                
+                # Exponential backoff: 1s, 2s, 4s, ... + random jitter
+                wait_time = (2 ** attempt) + random.random()
+                logger.info(f"{wait_time:.2f}초 후 재시도합니다.")
+                time.sleep(wait_time)
+
+            except anthropic.APIError as e:
+                logger.error(f"콘텐츠 생성 중 API 오류 발생 (시도 {attempt+1}/{self.max_retries}): {e}")
+                traceback.print_exc()
+                if attempt >= self.max_retries - 1:
+                    logger.error("최대 재시도 횟수 초과. API 오류로 콘텐츠 생성 실패.")
+                    if existing_content:
+                        existing_content.title = f"{keyword_text} (생성 실패)"
+                        existing_content.content = f"콘텐츠 생성 중 최종 오류 발생: {str(e)}"
+                        existing_content.save()
+                    return None
+                time.sleep(self.retry_delay) # Fixed delay for other API errors
+
+            except Exception as e:
+                logger.error(f"콘텐츠 생성 중 예기치 않은 오류 발생: {e}")
+                traceback.print_exc()
+                if existing_content:
+                    existing_content.title = f"{keyword_text} (생성 실패)"
+                    existing_content.content = f"콘텐츠 생성 중 최종 오류 발생: {str(e)}"
+                    existing_content.save()
+                return None # For unexpected errors, fail fast
                     
     def _format_research_data(self, news_sources, academic_sources, general_sources, statistics):
         research_data = {'news': [], 'academic': [], 'general': [], 'statistics': []}
@@ -297,67 +313,54 @@ class ContentGenerator:
 
 
         prompt = f"""
-        다음 조건들을 준수하여 전문성과 친근함이 조화된, 읽기 쉽고 실용적인 블로그 글을 작성해주세요:
+        당신은 {data.get('target_audience', {}).get('persona', '전문 블로그 작가')}입니다. 다음 지침에 따라 '{keyword}' 키워드에 대한 블로그 게시물을 작성해 주세요.
 
-        {optimization_requirements}
+        ## 최종 목표: 독자가 글을 끝까지 읽고, 제시된 해결책에 만족하며, {data.get('business_info', {}).get('name', '우리 회사')}를 신뢰하게 만드는 것
 
-        필수 활용 자료 (본문에 자연스럽게 인용):
-        {research_text if research_text else "(제공된 특정 뉴스/학술/일반 자료 없음. 일반적인 정보 활용 가능)"}
-        
-        통계 자료 (본문에 자연스럽게 인용):
-        {statistics_text}
+        ---
 
-        **중요 참고자료 인용 지침:**
-        1. 본문에서 [1], [2]와 같은 인용번호 표시는 절대 사용하지 마세요.
-        2. 대신 "X 보고서에 따르면" 또는 "Y 연구 결과에 의하면" 등 출처 이름을 직접 언급하는 방식으로 인용하세요. (예: "한국석유공사 보고서에 따르면...")
-        3. 참고자료의 출처명과 내용을 정확하게 언급해주세요.
-        4. 링크는 글 하단의 참고자료 섹션에 자동으로 추가되므로 본문에 URL을 포함하지 마세요.
-        5. 각 소제목 섹션에서 (또는 본론 전반에 걸쳐) 관련 참고자료를 출처를 명시하여 인용하세요.
+        ### **블로그 게시물 작성 필수 지침**
 
-        1. 글의 구조와 형식
-        - 전체 구조: 서론(약 20%) - 본론(약 60%) - 결론(약 20%)
-        - 각 소제목은 ### 마크다운으로 표시
-        - 소제목 구성:
+        1.  **페르소나 및 타겟 독자:**
+            -   **작성자 페르소나:** {data.get('target_audience', {}).get('persona', '해당 분야의 깊이 있는 전문가')}
+            -   **타겟 독자:** {data.get('target_audience', {}).get('description', '초보자부터 전문가까지 모두')}
+            -   **글의 목적:** {data.get('target_audience', {}).get('goal', '정보 제공 및 문제 해결')}
+            -   **어조와 스타일:** {data.get('target_audience', {}).get('tone_and_style', '전문적이고 신뢰감 있지만, 이해하기 쉬운 어조')}
+
+        2.  **[필수] 서론 작성 가이드 (전문성 어필, 공감, 강력한 유도):**
+            -   **공감 형성:** 독자가 '{keyword}' 문제로 겪는 '구체적인 불편함'과 '답답한 감정'을 정확히 짚어내며 깊은 공감대를 형성하세요. (예: "혹시 '{keyword}' 문제 때문에 밤잠 설치고 계신가요? 수많은 정보를 찾아봤지만, 결국 시간만 낭비한 것 같아 허탈하신가요?")
+            -   **전문성 어필 및 신뢰 구축:** "{data.get('business_info', {}).get('name', '우리 회사')}는 이 분야의 전문가로서 수많은 고객들의 문제를 해결해왔습니다. 그 경험과 노하우를 바탕으로, 여러분의 시간을 아껴줄 가장 효과적인 방법만을 알려드리겠습니다." 와 같이 저희의 전문성을 드러내 독자가 글을 신뢰하게 만드세요.
+            -   **해결책 약속:** 이 글이 단순 정보 나열이 아닌, 문제를 '해결'할 '검증된 방법'과 '실용적인 팁'을 제공한다는 점을 명확히 약속하세요.
+            -   **독서 유도:** "이 글을 단 5분만 투자해서 끝까지 읽으신다면, 더 이상 헤매지 않고 문제를 해결할 명확한 청사진을 얻게 될 것입니다." 와 같이, 글을 놓치면 손해라는 인식을 주어 끝까지 읽도록 강력하게 유도하세요.
+
+        3.  **본문 작성 가이드:**
+            -   제공된 소제목(`subtopics`)을 모두 사용하여 본문을 구성하세요. 소제목은 `###` 마크다운을 사용하세요.
+            -   소제목 목록:
 {subtopic_lines}
-        - 전체 길이: {target_min_chars}-{target_max_chars}자 (공백 제외)
+            -   각 소제목 아래에는 최소 2-3개의 문단을 작성하여 내용을 풍부하게 만드세요.
+            -   독자의 이해를 돕기 위해, 전문 용어는 쉽게 풀어서 설명하고, 필요한 경우 실제 예시를 들어주세요.
+            -   제공된 참고 자료(뉴스, 학술, 일반, 통계)를 본문 내용에 자연스럽게 인용하여 글의 신뢰도를 높여주세요. 통계 자료는 최소 1개 이상 반드시 인용해야 합니다.
 
-        2. [필수] 서론 작성 가이드 (전문성 및 흥미 유발 강화)
-        서론은 다음 3단계 흐름을 반드시 따라야 합니다.
-        1. 문제 제기 및 공감: 독자의 가장 큰 고민({', '.join(target_audience.get('pain_points', []))})을 직접 언급하며 시작하세요. 가능하다면 제공된 통계/연구 자료를 인용하여 문제의 심각성을 부각시키세요. (예: "혹시 {keyword} 때문에 골치 아프신가요? 최근 A 연구에 따르면, 많은 분들이 비슷한 어려움을 겪고 있습니다.")
-        2. 전문가로서의 권위 제시 및 해결책 암시: {business_info.get('name', '저희')}의 전문성({business_info.get('expertise', '관련 분야의 깊은 경험')})을 간결하게 드러내세요. 단순히 '해결해 주겠다'가 아니라, '왜' 우리가 해결할 수 있는지 보여주는 것이 중요합니다. (예: "지난 N년간 이 분야를 다뤄온 전문가로서, 이 문제의 핵심 원인이 무엇인지 명확히 알고 있습니다. 사실, 대부분의 문제는 간단한 원칙 몇 가지만 알면 해결됩니다.")
-        3. 기대감 증폭 및 본문으로 연결: 이 글을 단 5분만 투자해 끝까지 읽으시면, 더 이상 {keyword} 때문에 시간 낭비하지 않고, (독자가 얻을 구체적 이득)을 얻게 되실 겁니다. 본문에서는 그 핵심 비법을 소제목별로 자세히 알려드리겠습니다.")
+        4.  **참고 자료 활용:**
+            {research_text}
+            {statistics_text}
+            - **중요 인용 지침:** 본문에서 [1], [2]와 같은 인용번호 표시는 절대 사용하지 마세요. 대신 "X 보고서에 따르면" 또는 "Y 연구 결과에 의하면" 등 출처 이름을 직접 언급하는 방식으로 인용하세요. 본문에 URL을 포함하지 마세요.
 
-        3. 글쓰기 스타일
-        - 전문가의 지식을 쉽게 설명하듯이 편안한 톤 유지
-        - 각 문단은 자연스럽게 다음 문단으로 연결
-        - 스토리텔링 요소 활용 가능
-        - 실제 사례나 비유를 통해 이해하기 쉽게 설명
+        5.  **최적화 요구사항:**
+            {optimization_requirements}
 
-        4. 핵심 키워드 활용 (위의 '키워드 및 주요 형태소 출현 횟수 조건' 참고)
-        - 주 키워드: {keyword}
-        - 각 목표 키워드/형태소를 지정된 범위 내에서 자연스럽게 사용
-            
-        5. [필수] 참고 자료 활용
-        - 본론 전반에 걸쳐 관련 통계/연구 자료를 자연스럽게 인용
-        - 인용할 때는 "~에 따르면", "~의 연구 결과", "~의 조사에 따르면" 등 명확한 표현 사용
-        - 모든 통계와 수치는 출처를 구체적으로 명시 (예: "2024년 Z 기관의 조사에 따르면...")
-        - 가능한 최신 자료를 우선적으로 활용
-        - 통계나 수치를 인용할 때는 그 의미나 시사점도 함께 설명
+        6.  **[필수] 결론 작성 가이드 (신뢰 구축 및 행동 유도):**
+            -   본문의 핵심 내용을 단순히 요약하는 것을 넘어, 독자가 '이제 무엇을 해야 할지' 명확히 알 수 있도록 행동 지침을 제시하며 마무리합니다.
+            -   "오늘 알려드린 방법을 당장 적용해보세요." 와 같이, 독자가 실천으로 옮기도록 자신감을 불어넣고 격려해주세요.
+            -   **가장 중요:** "만약 알려드린 방법으로도 문제가 해결되지 않거나, 상황이 급박하여 전문가의 즉각적인 조치가 필요하다면, 한순간도 주저하지 말고 저희에게 연락 주세요. 신속하게 도와드리겠습니다." 라는 문구를 **반드시 포함**하여, 독자가 막막할 때 기댈 수 있는 든든한 전문가라는 인식을 심어주세요.
+            -   독자와의 상호작용을 유도하는 질문을 던지세요. (예: "'{keyword}'에 대해 더 궁금한 점이 있다면 댓글로 알려주세요.")
 
-        6. 본론 작성 가이드
-        - 각 소제목마다 핵심 주제 한 줄 요약으로 시작 가능
-        - 이론 → 사례 → 실천 방법 순으로 구성 가능
-        - 참고 자료의 통계나 연구 결과를 자연스럽게 인용
-        - 전문적 내용도 쉽게 풀어서 설명
-        - 각 섹션 끝에서 다음 섹션으로 자연스러운 연결
+        7.  **참고 자료 섹션:**
+            -   글의 마지막에는 `## 참고자료` 라는 제목으로 섹션을 만들고, 본문 작성에 활용한 모든 참고 자료의 출처를 명확하게 밝혀주세요. (이 섹션은 글자수 카운트에서 제외됩니다.)
 
-        7. 결론 작성 가이드
-        - 본론 내용 요약
-        - 실천 가능한 다음 단계 제시
-        - "{business_info.get('name', '저희')}가 도와드릴 수 있다는 메시지" (선택적)
-        - 독자와의 상호작용 유도 (예: 질문, 댓글 요청)
+        ---
 
-        위 조건들을 바탕으로, 특히 타겟 독자({target_audience.get('primary', '')})의 어려움을 해결하는 데 초점을 맞추어 블로그 글을 작성해주세요.
+        이제 위의 모든 지침을 종합하여, 독자의 기대를 뛰어넘는 고품질 블로그 게시물 작성을 시작해 주세요.
         """
         return prompt
     
