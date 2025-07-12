@@ -1,0 +1,21 @@
+# Exclude large directories and unnecessary files
+
+# Git repository
+.git/
+
+# Python virtual environments
+.venv/
+blogvenv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS / IDE specific
+.DS_Store
+.idea/
+.vscode/
+
+# Deployment artifacts
+deploy.zip
